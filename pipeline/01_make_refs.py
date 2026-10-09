@@ -15,13 +15,13 @@ from PIL import Image
 
 PROJECT = sys.argv[1]
 ONLY = set(sys.argv[2:])
-sys.path.insert(0, os.path.join(PROJECT, "work", "vendor"))
+sys.path.insert(0, os.path.join(PROJECT, "pipeline", "vendor"))
 
 PAD = 0.25
 LONG_SIDE = 1024
 
 from spandrel import ModelLoader
-upscaler = ModelLoader().load_from_file(os.path.join(PROJECT, "work", "models", "RealESRGAN_x4plus.pth")).cuda().eval()
+upscaler = ModelLoader().load_from_file(os.path.join(PROJECT, "pipeline", "models", "RealESRGAN_x4plus.pth")).cuda().eval()
 
 
 def upscale4x(rgb):
@@ -46,9 +46,10 @@ for obj in scene["objects"]:
         pad = max(6, int(max(bx2 - bx1, by2 - by1) * PAD))
         x1, y1, x2, y2 = bx1 - pad, by1 - pad, bx2 + pad, by2 + pad
     x1, y1, x2, y2 = max(0, x1), max(0, y1), min(W, x2), min(H, y2)
-    up = upscale4x(img[y1:y2, x1:x2])
+    crop = img[y1:y2, x1:x2]
+    up = upscale4x(crop) if max(crop.shape[:2]) * 2 < LONG_SIDE else crop   # big crops are sharp enough already
     s = LONG_SIDE / max(up.shape[:2])
     up = cv2.resize(up, None, fx=s, fy=s, interpolation=cv2.INTER_LANCZOS4 if s > 1 else cv2.INTER_AREA)
-    up = (np.clip((up.astype(np.float32) / 255) ** 0.62 * 1.1, 0, 1) * 255).astype(np.uint8)
+    up = (np.clip((up.astype(np.float32) / 255) ** scene.get("ref_gamma", 0.62) * 1.1, 0, 1) * 255).astype(np.uint8)
     Image.fromarray(up).save(os.path.join(out_dir, "ref.png"))
     print(f"{obj['id']}: {x2 - x1}x{y2 - y1}px -> {up.shape[1]}x{up.shape[0]}")

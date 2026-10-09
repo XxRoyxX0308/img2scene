@@ -1,10 +1,15 @@
-# Everything the pipeline produces or downloads (candidates, GLBs, renders, logs, ESRGAN weights, vendored spandrel)
+# Everything the pipeline produces (candidates, GLBs, renders, logs)
 work/*
+
+# Downloaded dependencies: vendored spandrel (pip --target) and the ESRGAN weights
+pipeline/vendor/
+pipeline/models/
 
 # Blender
 *.blend
 *.blend1
 *.blend2
+*.json
 
 # 3D models and model weights, wherever they end up
 *.glb

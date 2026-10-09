@@ -23,7 +23,12 @@ PREVIEW = "--preview" in sys.argv   # Workbench renders (no lighting/fog, almost
 scene_cfg = json.load(open(os.path.join(PROJECT, "scene.json"), encoding="utf-8"))
 IMG_W, IMG_H = scene_cfg["image_size"]
 env = scene_cfg["environment"]
-STAGE_R, STAGE_H = env["stage"]["radius_m"], env["stage"]["height_m"]
+ENV_TYPE = env.get("type", "round_hall")   # "round_hall": circular lobby with a stage; "ruin_hall": walls traced from the image
+STAGE_R, STAGE_H = (env["stage"]["radius_m"], env["stage"]["height_m"]) if "stage" in env else (0.0, 0.0)
+HALL_R = env["hall"]["radius_m"] if "hall" in env else env.get("scatter_limit_m", 30.0)
+# renders default to 2x the image; large images set render_width instead
+RENDER_W = scene_cfg.get("render_width", IMG_W * 2)
+RENDER_H = round(RENDER_W * IMG_H / IMG_W)
 SURFACES = env.get("surfaces", {})   # per-surface material spec, see scene_surfaces.py
 
 # ---------------------------------------------------------------- reset
@@ -90,6 +95,16 @@ def unproject(u, v, depth):
     x = (u - IMG_W / 2) / FOCAL
     y = -(v - IMG_H / 2) / FOCAL
     return CAM_POS + depth * (x * CAM_RIGHT + y * CAM_UP + CAM_FWD)
+
+
+def pixel_dir(u, v):
+    return ((u - IMG_W / 2) / FOCAL) * CAM_RIGHT + (-(v - IMG_H / 2) / FOCAL) * CAM_UP + CAM_FWD
+
+
+def ground_hit(u, v):
+    """Where the view ray through pixel (u, v) meets the floor (z = 0)."""
+    d = pixel_dir(u, v)
+    return CAM_POS + (-CAM_POS.z / d.z) * d
 
 
 def px_to_m(px, depth):
@@ -165,6 +180,94 @@ def build_environment():
     mod.offset = 1
     bpy.ops.object.shade_auto_smooth()
     move_to(o, col_env)
+
+
+WALL_PLANES = []   # (point on the wall face, normal pointing into the wall), filled by build_ruin_hall
+
+
+def inside_hall(xy, margin=0.3):
+    return all((Vector(xy) - a).dot(n) < -margin for a, n in WALL_PLANES)
+
+
+def build_ruin_hall():
+    """Rectangular hall whose walls are traced from the image: each wall is given by two pixels on its foot line,
+    which are projected onto the floor. Windows and pilasters are given in pixels too and projected onto the wall."""
+    def surf(name, fallback):
+        return scene_surfaces.surface_material(name, SURFACES.get(name), fallback, PROJECT)
+
+    bpy.ops.mesh.primitive_plane_add(size=120, location=(0, 20, 0))
+    o = bpy.context.active_object
+    o.name = "Floor"
+    o.data.materials.append(surf("floor", (0.2, 0.2, 0.2)))
+    move_to(o, col_env)
+
+    wall_mat = surf("hall_wall", (0.45, 0.46, 0.45))
+    trim_mat = surf("pilaster", SURFACES.get("hall_wall", {}).get("color", (0.4, 0.41, 0.4)))
+    bar_mat = material("window_bars", (0.12, 0.07, 0.05), rough=0.8)
+    cam_xy = CAM_POS.xy
+    for w in env.get("walls", []):
+        a, b = ground_hit(*w["base"][0]).xy, ground_hit(*w["base"][1]).xy
+        t = (b - a).normalized()
+        ext = w.get("extend_m", [0, 0])
+        a, b = a - t * ext[0], b + t * ext[1]
+        n = Vector((-t.y, t.x))
+        if n.dot((a + b) / 2 - cam_xy) < 0:      # n points away from the camera, into the wall
+            n = -n
+        WALL_PLANES.append((a.copy(), n.copy()))
+        h, thick, length = w["height_m"], w.get("thick_m", 0.5), (b - a).length
+        ang = math.atan2(t.y, t.x)
+        mid = (a + b) / 2 + n * thick / 2
+        add_box(w["id"], (mid.x, mid.y, h / 2), (length, thick, h), wall_mat, col_env, rot=(0, 0, ang))
+        print(f"wall {w['id']}: ({a.x:.1f},{a.y:.1f}) -> ({b.x:.1f},{b.y:.1f}) length {length:.1f}m")
+
+        def on_wall(u, v):
+            """(distance along the wall from a, height) of the point where pixel (u, v)'s ray meets the wall face."""
+            d = pixel_dir(u, v)
+            k = (a - cam_xy).dot(n) / d.xy.dot(n)
+            q = CAM_POS + k * d
+            return (q.xy - a).dot(t), q.z
+
+        def wall_box(name, s0, s1, z0, z1, depth, mat, out=0.0):
+            c = a + t * (s0 + s1) / 2 - n * (depth / 2 + out)
+            return add_box(name, (c.x, c.y, (z0 + z1) / 2), (abs(s1 - s0), depth, abs(z1 - z0)), mat, col_env, rot=(0, 0, ang))
+
+        for i, win in enumerate(w.get("windows", [])):
+            (s0, z1), (s1, z0) = on_wall(win["bbox"][0], win["bbox"][1]), on_wall(win["bbox"][2], win["bbox"][3])
+            s0, s1 = sorted((s0, s1))
+            z0, z1 = max(0.05, min(z0, z1)), min(h - 0.05, max(z0, z1))
+            glow = material(f"{w['id']}_win{i}", win.get("color", (0.75, 0.8, 0.82)), emission=win.get("emission", 2.0))
+            wall_box(f"{w['id']}_win{i}", s0, s1, z0, z1, 0.04, glow)
+            cols, rows = win.get("grid", [4, 5])
+            for c in range(cols + 1):
+                sc = s0 + (s1 - s0) * c / cols
+                wall_box(f"{w['id']}_win{i}_v{c}", sc - 0.03, sc + 0.03, z0, z1, 0.06, bar_mat, out=0.04)
+            for r in range(rows + 1):
+                zr = z0 + (z1 - z0) * r / rows
+                wall_box(f"{w['id']}_win{i}_h{r}", s0, s1, zr - 0.03, zr + 0.03, 0.06, bar_mat, out=0.04)
+        for i, u in enumerate(w.get("pilasters", [])):
+            sp, _ = on_wall(u, IMG_H / 2)
+            pw = w.get("pilaster_w_m", 0.7)
+            wall_box(f"{w['id']}_pil{i}", sp - pw / 2, sp + pw / 2, 0, h, w.get("pilaster_d_m", 0.35), trim_mat)
+        for i, band in enumerate(w.get("bands", [])):      # horizontal ledges / beams along the wall, heights in metres
+            wall_box(f"{w['id']}_band{i}", 0, length, band["z_m"], band["z_m"] + band.get("h_m", 0.5), band.get("d_m", 0.4),
+                     trim_mat)
+
+    roof = env.get("roof")
+    if roof:
+        x0, x1, y0, y1 = roof["x_m"][0], roof["x_m"][1], roof["y_m"][0], roof["y_m"][1]
+        z, th = roof["z_m"], 0.3
+        sx0, sx1, sy0, sy1 = roof.get("skylight_m", [0, 0, 0, 0])
+        roof_mat = surf("roof", (0.18, 0.18, 0.17))
+        # four slabs around the skylight opening
+        for name, (ax0, ax1, ay0, ay1) in {"roof_left": (x0, sx0, y0, y1), "roof_right": (sx1, x1, y0, y1),
+                                           "roof_front": (sx0, sx1, y0, sy0), "roof_back": (sx0, sx1, sy1, y1)}.items():
+            if ax1 - ax0 > 0.01 and ay1 - ay0 > 0.01:
+                add_box(name, ((ax0 + ax1) / 2, (ay0 + ay1) / 2, z + th / 2), (ax1 - ax0, ay1 - ay0, th), roof_mat, col_env)
+        beam_mat = material("roof_beams", (0.16, 0.13, 0.11), rough=0.8)
+        nb = roof.get("beams", 0)
+        for i in range(nb):
+            y = y0 + (y1 - y0) * (i + 0.5) / nb
+            add_box(f"roof_beam{i}", ((x0 + x1) / 2, y, z - 0.35), (x1 - x0, 0.35, 0.7), beam_mat, col_env)
 
 
 def build_props():
@@ -295,7 +398,8 @@ def build_image_slab(cfg):
     return front, Vector((1.0, thick + relief, aspect))
 
 
-def place_model(obj, dims, bbox, depth, grounded, yaw_deg, support, name, support_mat, fit="dominant", roll_deg=0.0):
+def place_model(obj, dims, bbox, depth, grounded, yaw_deg, support, name, support_mat, fit="dominant", roll_deg=0.0,
+                pitch_deg=0.0, lift_m=0.0):
     u1, v1, u2, v2 = bbox
     w, h = px_to_m(u2 - u1, depth), px_to_m(v2 - v1, depth)
     if fit == "inside":      # whole model inside the bbox (for objects whose pose differs from the image)
@@ -303,10 +407,11 @@ def place_model(obj, dims, bbox, depth, grounded, yaw_deg, support, name, suppor
     else:                    # match the dominant silhouette dimension
         s = w / dims.x if (u2 - u1) > (v2 - v1) else h / dims.z
     c = unproject((u1 + u2) / 2, (v1 + v2) / 2, depth)
-    z = support_height(c.xy) if grounded else c.z - s * dims.z / 2
+    z = support_height(c.xy) + lift_m if grounded else c.z - s * dims.z / 2
     obj.location = (c.x, c.y, z)
     obj.scale = (s, s, s)
-    obj.rotation_euler = (0, math.radians(roll_deg), math.radians(yaw_deg))
+    obj.rotation_mode = 'XYZ'   # glTF imports come in as quaternion-rotated objects
+    obj.rotation_euler = (math.radians(pitch_deg), math.radians(roll_deg), math.radians(yaw_deg))
     if support:
         add_support(name, c, s * dims.x, s * dims.y, z, support_mat)
     print(f"placed {name}: loc=({c.x:.2f},{c.y:.2f},{z:.2f}) size={s * dims.x:.2f}x{s * dims.y:.2f}x{s * dims.z:.2f}m")
@@ -324,7 +429,8 @@ def build_models():
         else:
             obj, dims = import_glb(glb, cfg["id"], cfg.get("model_yaw_deg", 0.0))
         place_model(obj, dims, tight_bbox(cfg), cfg["depth_m"], cfg.get("grounded", False), cfg.get("yaw_deg", 0),
-                    cfg.get("support", False), cfg["id"], support_mat, cfg.get("fit", "dominant"), cfg.get("roll_deg", 0.0))
+                    cfg.get("support", False), cfg["id"], support_mat, cfg.get("fit", "dominant"), cfg.get("roll_deg", 0.0),
+                    cfg.get("pitch_deg", 0.0), cfg.get("lift_m", 0.0))
         # repeated objects are linked duplicates of the same mesh
         for i, inst in enumerate(cfg.get("instances", [])):
             dup = obj.copy()
@@ -332,7 +438,7 @@ def build_models():
             col_models.objects.link(dup)
             place_model(dup, dims, inst["bbox"], inst["depth_m"], inst.get("grounded", False), inst.get("yaw_deg", 0),
                         inst.get("support", False), dup.name, support_mat, inst.get("fit", cfg.get("fit", "dominant")),
-                        inst.get("roll_deg", 0.0))
+                        inst.get("roll_deg", 0.0), inst.get("pitch_deg", 0.0), inst.get("lift_m", 0.0))
 
 
 # ---------------------------------------------------------------- camera, lights, fog
@@ -365,6 +471,12 @@ def build_camera_and_lights():
     over.location = (ANCHOR_XY.x - 4.8, ANCHOR_XY.y - 7.0, 2.6)
     look_at(over, (ANCHOR_XY.x + 0.6, ANCHOR_XY.y + 1.0, 2.6))
     col_light.objects.link(over)
+    if ENV_TYPE == "ruin_hall":
+        ov = env.get("overview", {})
+        over.location = ov.get("location", (ANCHOR_XY.x + 6.0, ANCHOR_XY.y - 5.0, 5.5))
+        look_at(over, ov.get("target", (ANCHOR_XY.x + 3.0, ANCHOR_XY.y + 5.0, 1.0)))
+        build_daylight()
+        return cam, over
 
     target = Vector((ANCHOR_XY.x, ANCHOR_XY.y, 3.0))
     lc = scene_cfg["lights"]
@@ -430,12 +542,61 @@ def build_camera_and_lights():
     return cam, over
 
 
+def build_daylight():
+    """Overcast daylight for the ruin hall: bright sky world, a soft sun through the roof opening, light haze."""
+    lc = scene_cfg["lights"]
+    sky = lc.get("sky", {})
+    world = bpy.data.worlds.new("World")
+    world.use_nodes = True
+    bg = world.node_tree.nodes["Background"]
+    bg.inputs[0].default_value = (*sky.get("color", (0.8, 0.86, 0.9)), 1)
+    bg.inputs[1].default_value = sky.get("strength", 1.0)
+    scene.world = world
+
+    sun_cfg = lc.get("sun")
+    if sun_cfg:
+        sun = bpy.data.lights.new("Sun", 'SUN')
+        sun.energy, sun.color = sun_cfg.get("strength", 3.0), sun_cfg.get("color", (1.0, 0.97, 0.9))
+        sun.angle = math.radians(sun_cfg.get("soft_deg", 8))
+        so = bpy.data.objects.new("Sun", sun)
+        el, az = math.radians(sun_cfg.get("elevation_deg", 60)), math.radians(sun_cfg.get("azimuth_deg", 200))
+        so.location = (0, 10, 30)
+        # azimuth is the compass direction the light comes from (0 = from +Y, 90 = from +X)
+        look_at(so, Vector(so.location) - Vector((math.cos(el) * math.sin(az), math.cos(el) * math.cos(az), math.sin(el))))
+        col_light.objects.link(so)
+    for i, a in enumerate(lc.get("area", [])):   # extra soft lights (window spill, fill), positions in world metres
+        al = bpy.data.lights.new(f"Area_{i}", 'AREA')
+        al.energy, al.color, al.size = a["energy_w"], a.get("color", (1, 1, 1)), a.get("size_m", 4)
+        ao = bpy.data.objects.new(f"Area_{i}", al)
+        ao.location = a["location"]
+        look_at(ao, a["target"])
+        col_light.objects.link(ao)
+
+    if lc.get("fog_density", 0) > 0:
+        roof = env.get("roof", {"x_m": [-12, 12], "y_m": [0, 30], "z_m": 12})
+        x0, x1, y0, y1 = *roof["x_m"], *roof["y_m"]
+        fog = add_box("Fog_Volume", ((x0 + x1) / 2, (y0 + y1) / 2, roof["z_m"] / 2), (x1 - x0, y1 - y0, roof["z_m"]), None, col_env)
+        fm = bpy.data.materials.new("fog")
+        fm.use_nodes = True
+        nt = fm.node_tree
+        nt.nodes.clear()
+        out = nt.nodes.new("ShaderNodeOutputMaterial")
+        vol = nt.nodes.new("ShaderNodeVolumeScatter")
+        vol.inputs["Density"].default_value = lc["fog_density"]
+        vol.inputs["Anisotropy"].default_value = 0.3
+        vol.inputs["Color"].default_value = (0.9, 0.93, 0.95, 1)
+        nt.links.new(vol.outputs[0], out.inputs["Volume"])
+        fog.data.materials.clear()
+        fog.data.materials.append(fm)
+        fog.display_type = 'WIRE'
+
+
 def setup_render():
     if PREVIEW:
         scene.render.engine = 'BLENDER_WORKBENCH'
         scene.display.shading.light = 'STUDIO'
         scene.display.shading.color_type = 'TEXTURE'
-        scene.render.resolution_x, scene.render.resolution_y = IMG_W * 2, IMG_H * 2
+        scene.render.resolution_x, scene.render.resolution_y = RENDER_W, RENDER_H
         fog = bpy.data.objects.get("Fog_Volume")
         if fog:
             fog.hide_render = True
@@ -446,7 +607,7 @@ def setup_render():
             break
         except TypeError:
             continue
-    scene.render.resolution_x, scene.render.resolution_y = IMG_W * 2, IMG_H * 2
+    scene.render.resolution_x, scene.render.resolution_y = RENDER_W, RENDER_H
     scene.render.film_transparent = False
     for attr, val in (("use_raytracing", True), ("volumetric_tile_size", '4'), ("volumetric_samples", 96), ("taa_render_samples", 48)):
         try:
@@ -454,7 +615,8 @@ def setup_render():
         except Exception:
             pass
     try:
-        scene.view_settings.look = 'AgX - Medium High Contrast'
+        scene.view_settings.look = scene_cfg["lights"].get("look", 'AgX - Medium High Contrast')
+        scene.view_settings.exposure = scene_cfg["lights"].get("exposure", 0.0)
     except Exception:
         pass
 
@@ -465,12 +627,12 @@ def render(cam, name):
     bpy.ops.render.render(write_still=True)
 
 
-build_environment()
+build_ruin_hall() if ENV_TYPE == "ruin_hall" else build_environment()
 build_props()
 build_models()
 # small clutter goes in last so it can avoid everything that is already standing on the floor
 scene_surfaces.scatter(scene_cfg.get("scatter"), col_scatter, ANCHOR_XY, support_height,
-                       (col_models, col_props), env["hall"]["radius_m"])
+                       (col_models, col_props), HALL_R, allowed=inside_hall if WALL_PLANES else None)
 ref_cam, over_cam = build_camera_and_lights()
 setup_render()
 os.makedirs(os.path.join(PROJECT, "work", "renders"), exist_ok=True)

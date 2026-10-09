@@ -40,14 +40,14 @@ scene.blend
 
 ### 不在版本庫內、需要自行準備的檔案
 
-`work/` 整個資料夾不進版控，其中兩項是執行必需的：
+以下兩項不進版控，但執行時必需，放在 `pipeline/` 底下：
 
 ```bash
 # 在 WSL 內，$P 為專案路徑
-mkdir -p $P/work/models $P/work/vendor
-wget -P $P/work/models https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+mkdir -p $P/pipeline/models $P/pipeline/vendor
+wget -P $P/pipeline/models https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
 conda activate trellis2
-pip install --no-deps --target $P/work/vendor spandrel     # 裝在專案內，不動 trellis2 環境
+pip install --no-deps --target $P/pipeline/vendor spandrel     # 裝在專案內，不動 trellis2 環境
 ```
 
 ## 使用方式

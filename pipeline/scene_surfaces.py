@@ -16,9 +16,9 @@ import random
 
 import bpy
 import numpy as np
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
-PRESETS = ("plain", "concrete", "tiles", "painted", "metal", "gravel", "wood")
+PRESETS = ("plain", "concrete", "tiles", "painted", "metal", "gravel", "wood", "weathered")
 
 
 def _base(name):
@@ -163,6 +163,54 @@ def surface_material(name, spec, fallback, project):
         _bump(nt, bsdf, vor.outputs["Distance"], 0.9, scale_m * 0.3)
         if rough is None:
             bsdf.inputs["Roughness"].default_value = 0.9
+    elif preset == "weathered":    # stained old concrete; scale_m = size of the big stains. Optional "stain", "moss" colours
+        mapping.inputs["Scale"].default_value = (1 / scale_m,) * 3
+        noise.inputs["Scale"].default_value = 1.0
+        noise.inputs["Detail"].default_value = 10.0
+        noise.inputs["Roughness"].default_value = 0.65
+        stain = tuple(spec.get("stain", _shade(color, 0.35)))
+        cr = _ramp(nt, stain, color, 0.38, 0.62)
+        L(noise.outputs["Fac"], cr.inputs["Fac"])
+        # water streaks: noise stretched along the vertical axis, multiplied in
+        smap = nt.nodes.new("ShaderNodeMapping")
+        smap.inputs["Scale"].default_value = (6 / scale_m, 6 / scale_m, 0.25 / scale_m)
+        L(nt.nodes["Geometry"].outputs["Position"], smap.inputs["Vector"])
+        streak = nt.nodes.new("ShaderNodeTexNoise")
+        streak.inputs["Scale"].default_value = 1.0
+        streak.inputs["Detail"].default_value = 4.0
+        L(smap.outputs["Vector"], streak.inputs["Vector"])
+        sr = _ramp(nt, (1 - spec.get("streaks", 0.5),) * 3, (1, 1, 1), 0.35, 0.6)
+        L(streak.outputs["Fac"], sr.inputs["Fac"])
+        mul = nt.nodes.new("ShaderNodeMixRGB")
+        mul.blend_type = 'MULTIPLY'
+        mul.inputs["Fac"].default_value = 1.0
+        L(cr.outputs["Color"], mul.inputs["Color1"])
+        L(sr.outputs["Color"], mul.inputs["Color2"])
+        out_col = mul.outputs["Color"]
+        if "moss" in spec:         # green growth in patches
+            mnoise = nt.nodes.new("ShaderNodeTexNoise")
+            mnoise.inputs["Scale"].default_value = 0.7
+            mnoise.inputs["Detail"].default_value = 8.0
+            mmap = nt.nodes.new("ShaderNodeMapping")
+            mmap.inputs["Location"].default_value = (13.7, 4.2, 0)
+            mmap.inputs["Scale"].default_value = (1 / scale_m,) * 3
+            L(nt.nodes["Geometry"].outputs["Position"], mmap.inputs["Vector"])
+            L(mmap.outputs["Vector"], mnoise.inputs["Vector"])
+            lo = 1 - spec.get("moss_amount", 0.4)
+            mr = _ramp(nt, (0, 0, 0), (1, 1, 1), lo, min(1.0, lo + 0.08))
+            L(mnoise.outputs["Fac"], mr.inputs["Fac"])
+            mix = nt.nodes.new("ShaderNodeMixRGB")
+            mix.inputs["Color2"].default_value = (*spec["moss"], 1)
+            L(mr.outputs["Color"], mix.inputs["Fac"])
+            L(out_col, mix.inputs["Color1"])
+            out_col = mix.outputs["Color"]
+        L(out_col, bsdf.inputs["Base Color"])
+        fine = nt.nodes.new("ShaderNodeTexNoise")
+        fine.inputs["Scale"].default_value = 40.0 * scale_m
+        L(mapping.outputs["Vector"], fine.inputs["Vector"])
+        _bump(nt, bsdf, fine.outputs["Fac"], 0.35, 0.004)
+        if rough is None:
+            bsdf.inputs["Roughness"].default_value = 0.9
     elif preset == "wood":         # scale_m = plank width
         mapping.inputs["Scale"].default_value = (1 / scale_m, 0.08 / scale_m, 1 / scale_m)
         noise.inputs["Scale"].default_value = 4.0
@@ -214,20 +262,38 @@ def _prototypes(kind, rng, colors):
             o = bpy.context.active_object
             o.scale = (1, 1.41, 1)
             bpy.ops.object.transform_apply(scale=True)
+        elif kind == "weeds":      # a tuft of thin leaning blades, 1 unit tall
+            parts = []
+            for _ in range(14):
+                lean, turn = rng.uniform(0.1, 0.7), rng.uniform(0, math.tau)
+                length = rng.uniform(0.5, 1.0)
+                bpy.ops.mesh.primitive_cone_add(vertices=4, radius1=rng.uniform(0.03, 0.06), radius2=0.0, depth=length,
+                                                location=(rng.uniform(-0.2, 0.2), rng.uniform(-0.2, 0.2), 0))
+                blade = bpy.context.active_object
+                blade.data.transform(Matrix.Translation((0, 0, length / 2)))
+                blade.rotation_euler = (lean, 0, turn)
+                parts.append(blade)
+            bpy.ops.object.select_all(action='DESELECT')
+            for blade in parts:
+                blade.select_set(True)
+            bpy.context.view_layer.objects.active = parts[0]
+            bpy.ops.object.join()
+            o = bpy.context.active_object
+            bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
         else:
-            raise ValueError(f"unknown scatter kind {kind!r}; choose rocks, blocks or papers")
+            raise ValueError(f"unknown scatter kind {kind!r}; choose rocks, blocks, papers or weeds")
         c = colors[i % len(colors)]
         mat = bpy.data.materials.new(f"scatter_{kind}_{i}")
         mat.use_nodes = True
         b = mat.node_tree.nodes["Principled BSDF"]
         b.inputs["Base Color"].default_value = (*c, 1)
-        b.inputs["Roughness"].default_value = 0.85 if kind == "rocks" else 0.5
+        b.inputs["Roughness"].default_value = 0.85 if kind in ("rocks", "weeds") else 0.5
         o.data.materials.append(mat)
         protos.append(o)
     return protos
 
 
-def scatter(specs, collection, anchor_xy, support_height, blockers, hall_radius):
+def scatter(specs, collection, anchor_xy, support_height, blockers, hall_radius, allowed=None):
     """specs: list of {"id", "kind", "count", "size_m": [min, max], "radius_m", "inner_radius_m",
     "colors": [[r,g,b], ...], "margin_m", "seed"}. Returns the number of items placed."""
     total = 0
@@ -236,7 +302,8 @@ def scatter(specs, collection, anchor_xy, support_height, blockers, hall_radius)
         kind = spec["kind"]
         colors = spec.get("colors") or {"rocks": [(0.25, 0.25, 0.27), (0.35, 0.33, 0.3)],
                                         "blocks": [(0.7, 0.1, 0.08), (0.8, 0.65, 0.1), (0.15, 0.3, 0.75), (0.2, 0.55, 0.25)],
-                                        "papers": [(0.85, 0.85, 0.8)]}[kind]
+                                        "papers": [(0.85, 0.85, 0.8)],
+                                        "weeds": [(0.12, 0.3, 0.06), (0.2, 0.38, 0.08)]}[kind]
         protos = _prototypes(kind, rng, [tuple(c) for c in colors])
         blocked = _footprints(blockers, spec.get("margin_m", 0.15))
         r_out = min(spec.get("radius_m", 8.0), hall_radius - 0.5)
@@ -248,7 +315,7 @@ def scatter(specs, collection, anchor_xy, support_height, blockers, hall_radius)
             ang, rad = rng.uniform(0, math.tau), math.sqrt(rng.uniform((r_in / r_out) ** 2, 1)) * r_out
             xy = Vector((anchor_xy.x + rad * math.cos(ang), anchor_xy.y + rad * math.sin(ang)))
             size = rng.uniform(s_lo, s_hi) if rng.random() < 0.85 else rng.uniform(s_hi, s_hi * 1.8)
-            if any((xy - c).length < r + size / 2 for c, r in blocked):
+            if any((xy - c).length < r + size / 2 for c, r in blocked) or (allowed and not allowed(xy)):
                 continue
             proto = rng.choice(protos)
             inst = bpy.data.objects.new(f"{spec['id']}_{placed:03d}", proto.data)
@@ -258,6 +325,9 @@ def scatter(specs, collection, anchor_xy, support_height, blockers, hall_radius)
             z = support_height(xy)
             if kind == "papers":
                 inst.location = (xy.x, xy.y, z + 0.003 + placed * 1e-5)
+                inst.rotation_euler = (0, 0, rng.uniform(0, math.tau))
+            elif kind == "weeds":
+                inst.location = (xy.x, xy.y, z)
                 inst.rotation_euler = (0, 0, rng.uniform(0, math.tau))
             else:
                 half_h = size * (0.31 if kind == "rocks" else 0.5 * proto.dimensions.z)
