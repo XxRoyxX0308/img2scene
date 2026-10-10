@@ -9,7 +9,7 @@
 |---|---|
 | **輸入** | 一張場景圖（放在專案根目錄，例如 `test.jpg`） |
 | **輸出** | `scene.blend`（貼圖已打包）、`work/renders/view_ref.png`、`view_overview.png`、`compare.png` |
-| **完成條件** | 場景內至少 10 種不同物件；每個物件至少生成並審核過 4 張 2D 圖；每個 3D 模型都經過檢視；地面與牆面有材質、地面有合適的散佈物；最終渲染與原圖構圖對得上 |
+| **完成條件** | 場景內至少 10 種不同物件；每個物件至少生成並審核過 4 張 2D 圖；每個 3D 模型都經過檢視；建築依原圖重建（不是幾個平面）；地面與牆面有材質、地面有合適的散佈物；最終渲染與原圖構圖對得上 |
 | **回報** | 結尾交付一份總結：物件清單與做法、哪些不合格及原因、與原圖的差異、耗時 |
 
 路徑約定：`$P` = 專案在 WSL 內的路徑（例如 `/mnt/d/UNIDENTIFIED/3D_test`）；`$PW` = 同一路徑的 Windows 寫法。
@@ -21,7 +21,7 @@
 | WSL Ubuntu | 使用者 `xxroyxx`，虛擬磁碟在 D 槽（HDD） | `wsl -e bash -lc '...'` |
 | TRELLIS.2 | `~/TRELLIS.2`，conda env `trellis2` | 由 `pipeline/trellis_loop.sh` 呼叫 |
 | ComfyUI + FLUX.2 klein | `~/ComfyUI`，conda env `comfyui` | `pipeline/comfy_start.sh` / `comfy_stop.sh` |
-| Blender 5.2 | `D:\Blender Foundation\Blender 5.2\blender.exe` | `blender -b -P <script> -- <args>` |
+| Blender 5.2 | 使用者開著的 Blender，已啟用 MCP for Blender 外掛 | Blender MCP 工具：`get_addon_status`、`get_scene_info`、`execute_blender_code`、`look` |
 
 硬性限制，違反會出事：
 
@@ -31,7 +31,9 @@
 4. **不要用會比對到自己的 `pkill -f` / `pgrep -f`**（指令字串本身含有樣式時會殺掉自己）。用 `comfy_stop.sh`，或把樣式第一個字母包成 `[x]`。
 5. **不要印出 `~/.cache/huggingface/token` 的內容**，也不要列出含有該 token 的程序指令列。
 6. 長時間工作（TRELLIS）用背景執行，並監看 `work/trellis.log` 的 `[done]` / `[FAIL]` 行。
-7. TRELLIS 執行期間只能跑 `--preview` 的 Blender 與 `06_inspect_models.py`（Workbench 引擎，幾乎不佔 VRAM），不要跑完整渲染。
+7. **Blender 場景只透過 Blender MCP 建立與修改。** 不要寫 `.py` 建置腳本，也不要用 `blender -b -P` 在背景跑；所有建模、擺位、材質、燈光、渲染都由你用 `execute_blender_code` 在使用者開著的 Blender 裡一步一步做，用 `look` 看結果。MCP 連不上時停下來告訴使用者，不要改走背景 Blender。
+8. ComfyUI 或 TRELLIS 佔用 GPU 期間，`look` 只用 `solid` / `wireframe` / `material` 著色，不要用 `rendered`，也不要渲染。
+9. 不要在 MCP 裡呼叫 `bpy.ops.wm.read_factory_settings` 或 `read_homefile`：會重置工作階段並中斷 MCP。要清空場景就逐一刪除物件與資料。
 
 時間參考（RTX 3060）：ComfyUI 冷啟動後第一張圖 2–5 分鐘，之後 9B 約 30 秒/張、4B 約 15 秒/張；TRELLIS 載入約 5 分鐘，每個物件 2–16 分鐘。
 
@@ -42,10 +44,10 @@
 步驟 2  01_make_refs.py → 每個物件的參考裁切圖 ref.png
 步驟 3  逐物件迭代生成 2D 圖：生成 → 看圖 → 決定是否改 prompt → 再生成（至少 4 張）
 步驟 4  寫 work/selection.json → 03_select_matte.py matte → 檢查去背
-步驟 5  trellis_loop.sh → 06_inspect_models.py → 逐一檢視 3D 模型，不合格的處理
-步驟 6  05_build_scene.py --preview → 調整擺位
-步驟 6b 表面材質與散佈物（地板、牆面材質；碎石、雜物）→ 渲染 → 看圖 → 調參數
-步驟 6c 完整渲染 → 燈光微調 → 對照原圖
+步驟 5  trellis_loop.sh → 用 MCP 把每個 GLB 匯入 Blender → look 逐一檢視，不合格的處理
+步驟 6  用 MCP 組裝場景：相機 → 建築 → 擺放模型與招牌
+步驟 6b 表面材質與散佈物 → look → 調整
+步驟 6c 燈光、霧、光暈 → 渲染 → 對照原圖 → 存 scene.blend
 步驟 7  總結回報
 ```
 
@@ -65,15 +67,11 @@
 **選物件的規則**
 
 - 至少 10 種不同物件，主角之外也要有道具與細節（燈具、招牌、箱子、支架等）。
-- 重複出現的同款物件只列一次，其餘用 `instances`。
-- 大面積結構（地板、牆、舞台、窗戶、前景遮擋）不走 img-to-3D，寫進 `environment` 與 `props`，由 Blender 程式生成。
-- 建築本身需要精確重建（樑、柱、階梯、路緣等不只是平面）時，設 `"environment": {"type": "script", "script": "scene_env.py"}`，
-  在專案根目錄寫一個該場景專用的 Python 檔：定義 `build(ctx)`，可選 `lights(ctx)`、`support_height(xy)`（回傳該點的地面高度，
-  用於高台與花台）、`scatter_allowed(xy)`。`ctx` 提供 `material`、`surface`（讀 `environment.surfaces.<名稱>`）、相機模型等輔助函式。
-  先用 `--preview` 渲染並與原圖疊圖比對輪廓，再調整尺寸。
-- 帶文字的平面物件（招牌、標示牌）設 `"mode": "image_slab"`：TRELLIS 會把文字重建成亂碼，這類物件改用正面 2D 圖做成立體浮雕板。
+- 重複出現的同款物件只列一次；其餘位置在步驟 6 用同一個模型的複本擺放。
+- 大面積結構（地板、牆、樑柱、階梯、路緣、窗戶、遠景大樓）不走 img-to-3D，也不寫進 `scene.json`；它們在步驟 6 由你用 MCP 直接在 Blender 裡建模。
+- 帶文字的平面物件（招牌、標示牌）設 `"mode": "image_slab"`：TRELLIS 會把文字重建成亂碼，這類物件只生成正面 2D 圖，步驟 6 在 Blender 裡做成貼圖薄板。
 
-**scene.json 結構**（完整範例見專案現有的 `scene.json`）
+**scene.json 結構**。它只描述「要生成哪些物件」（步驟 1–5 的腳本會讀）；Blender 場景怎麼組裝不寫在這裡。
 
 ```jsonc
 {
@@ -95,12 +93,7 @@
       "prompt": "Extract the ... from this image. ...",   // 初始 prompt，英文
       "trellis": {"faces": 300000, "texture": 2048}
     }
-  ],
-  "environment": { "anchor": "huggy", "stage": {...}, "hall": {...}, "balcony_ring": {...},
-                   "surfaces": {...} },   // 表面材質，見步驟 6b
-  "scatter": [ ... ],                     // 地面散佈物，見步驟 6b
-  "props": [ {"id": "wall_red", "bbox": [...], "depth_m": 18.0, "thick_m": 0.3, "color": [r,g,b]} ],
-  "lights": { "key_spot": {...}, "fog_density": 0.009 }
+  ]
 }
 ```
 
@@ -109,21 +102,12 @@
 | 欄位 | 用途 |
 |---|---|
 | `ref_bbox` | 參考裁切範圍（預設是 bbox 外擴 25%）；物件很小或需要更多上下文時指定 |
-| `grounded` | `true` 表示底部貼地（或貼舞台面），忽略 bbox 算出的高度 |
-| `support` | `true` 表示在物件下方自動加一個深色底座到地面 |
-| `yaw_deg` / `roll_deg` | 場景中的水平旋轉 / 傾斜 |
-| `fit` | `"inside"` 表示整個模型縮到 bbox 內；物件姿勢與原圖不同時用 |
-| `instances` | 同款物件的其他位置：`[{"bbox": [...], "depth_m": ..., "yaw_deg": ...}]` |
 | `seed_base` | 種子起點（預設 1000），想整組重來時換一個 |
-| `mode: "image_slab"` | 文字招牌；搭配 `slab_image`（預設用 `"rgba.png"`）、`slab_thickness`、`slab_relief` |
+| `mode: "image_slab"` | 文字招牌等平面物件：不跑 TRELLIS，步驟 6 用 2D 圖做成薄板 |
 | `trellis.pipeline_type` | 預設 `"1024_cascade"`；**實心方塊類（箱子、積木、櫃子）必須設 `"512"`**，否則 VRAM 不足會 CUDA 錯誤 |
 | `trellis.seed` | 3D 重做時換種子 |
-| `pos_m` | 已知真實位置時直接指定底部中心的世界座標 `[x, y]`（貼地）或 `[x, y, z]`，取代由 bbox 與深度反推的位置；`instances` 也可用 |
-| `width_m` / `height_m` | 已知真實尺寸時直接指定，取代由 bbox 推算的縮放；`instances` 也可用 |
-| `pitch_deg` | 繞水平軸旋轉；`image_slab` 設 `-90` 可平放在地上（報紙、海報） |
-| `emission` / `emission_threshold` | 讓物件以自身貼圖顏色發光（招牌、螢幕）；`emission_threshold` > 0 時只有貼圖亮部發光 |
 
-相機的 `camera.pitch_deg` 可直接指定俯仰角（例如由地平線或消失點算出），省略時由主角腳底位置反推。
+`bbox` 與 `depth_m` 在步驟 6 是擺位的起點（你自己讀來用），不是由程式自動套用。
 
 深度估計原則：先定主角的距離，其他物件依前後遮擋關係相對給值；同一平面上的東西給相同深度。寬度（公尺）≈ bbox 像素寬 ÷ 703 × 深度（hfov 50°、圖寬 656 時），用它檢查尺寸是否合理。
 
@@ -238,137 +222,164 @@ wsl -e bash -lc 'bash $P/pipeline/trellis_loop.sh $P 8 > $P/work/trellis.log 2>&
 
 監看 `work/trellis.log`：`[done] <id> in Ns`、`[FAIL] <id>`、`[all done]`、`[gave up after 8 attempts]`。
 
-完成後產生檢視圖並逐一 Read：
+完成後用 MCP 把每個 `model.glb` 匯入 Blender 檢視（這些物件之後直接留在場景裡用，見步驟 6 的「匯入模型」）：
 
-```bash
-"D:/Blender Foundation/Blender 5.2/blender.exe" -b -P pipeline/06_inspect_models.py -- "$PW"
-# → work/inspect/<id>.png（左：正面，右：背面斜角）
-```
+1. `execute_blender_code`：`bpy.ops.import_scene.gltf(filepath=...)`，合併成單一網格、套用變換、原點移到底部中心，物件命名為 `<id>`，
+   放進 `Models_TRELLIS` 集合。先放在遠離原點的暫存位置排成一列即可。
+2. `look`：`mode="angles"`、`target=["<id>"]`、`shading="material"`，至少看正面與背面斜角兩個方向。
+3. 逐一對照選定的 2D 圖判斷。
 
 | 看到的問題 | 處理方式 |
 |---|---|
 | 同一物件反覆 `[FAIL]`（CUDA error、device not ready） | 在 `trellis` 加 `"pipeline_type": "512"`，重跑 loop |
-| 文字或字母變成亂碼 | 改成 `"mode": "image_slab"`；需要一張正面 2D 圖，沒有就回步驟 3 用正面視角重新生成 |
+| 文字或字母變成亂碼 | 改成 `"mode": "image_slab"`（刪掉匯入的模型）；需要一張正面 2D 圖，沒有就回步驟 3 用正面視角重新生成 |
 | 形狀明顯錯誤、破面、多出雜物 | 刪掉該物件的 `model.glb`，在 `trellis` 設不同的 `"seed"` 重跑；仍不行就回步驟 3 換一張 2D 圖 |
 | 貼圖略糊但形狀正確，且是遠處小道具 | 可接受，在總結中註明 |
 
-重做單一物件：刪除 `work/objects/<id>/model.glb` 後重跑 `trellis_loop.sh`。每個物件最多重做 2 次，之後就接受並註明。
+重做單一物件：刪除 `work/objects/<id>/model.glb` 與 Blender 裡的舊物件後重跑 `trellis_loop.sh`，再重新匯入。每個物件最多重做 2 次，之後就接受並註明。
 
-**輸出**：每個非 `image_slab` 物件的 `work/objects/<id>/model.glb`，以及 `work/inspect/<id>.png`。
+**輸出**：每個非 `image_slab` 物件的 `work/objects/<id>/model.glb`，且都已匯入 Blender 並看過。
 
-## 8. 步驟 6：組裝 Blender 場景
+## 8. 步驟 6：用 Blender MCP 組裝場景
 
-先用預覽模式檢查擺位（快、不佔 VRAM、不存檔）：
+這一步沒有建置腳本。場景由你透過 Blender MCP 在使用者開著的 Blender 裡直接建出來：`execute_blender_code` 執行 `bpy` 程式碼，
+`look` 看結果，`get_scene_info` 查物件的位置與尺寸。**`scene.blend` 本身就是成果，也是唯一的狀態**；要改場景就改 Blender 裡的東西，
+不要把建置邏輯寫成 `.py` 檔。
 
-```bash
-"D:/Blender Foundation/Blender 5.2/blender.exe" -b -P pipeline/05_build_scene.py -- "$PW" --preview
-# → work/renders/preview_ref.png、preview_overview.png
-```
+**工作方式**
 
-Read `preview_ref.png` 並與原圖比對，逐項檢查後修改 `scene.json` 再重跑：
+- 一開始先 `get_addon_status`、`get_scene_info`。場景裡若已有上一次的成果，先看清楚再決定接著做還是清掉重來（清空前要問使用者）。
+- 小步進行：每次 `execute_blender_code` 只做一件事（建一個構件、擺一組物件、調一組燈），印出關鍵數值，接著 `look` 確認，再做下一件。
+- 不要跨呼叫依賴 Python 變數；每段程式碼都從 `bpy.data.objects["名稱"]` 重新取得物件。需要重複用的小函式就在該段程式碼裡再寫一次。
+- 物件命名要讓之後的自己（或下一個工作階段）看得懂：模型用 `scene.json` 的 `<id>`、複本用 `<id>_2`、建築用 `Pier_R1`、`Deck`、`Stairs` 這類名稱、
+  燈用 `L_` 開頭。集合固定為 `Models_TRELLIS`、`Environment`、`Scatter`、`Lights_Camera`。
+- 依 MCP 的規則寫程式碼：著色器節點用 `type` 找（`n.type == "BSDF_PRINCIPLED"`），不要用名稱；列舉值先讀再設。
+- 每完成一個小節就存檔：`bpy.ops.wm.save_as_mainfile(filepath=r"$PW\scene.blend")`（第一次）或 `bpy.ops.wm.save_mainfile()`。
+- `look` 的 `max_size` 平常用 800–1200 即可，只有要看細節時才放大。
 
-| 問題 | 調整 |
+### 6.1 相機
+
+相機必須先定好，後面所有尺寸都靠它量。世界座標：X 向右、Y 向相機前方、Z 向上，地面 z = 0，相機在 `(0, 0, 高度)`。
+
+1. **由原圖求相機參數。** 找兩組互相垂直的水平線（地磚縫、牆腳線、樑），各自延伸求消失點 `(u1, v1)`、`(u2, v2)`（可用 `00_grid.py` 的格線圖讀座標）。
+   兩點的平均 `v` 是地平線；主點取圖片中心 `(cx, cy)`；焦距（像素）`f = sqrt(-(u1-cx)(u2-cx) - (vh-cy)²)`，`vh` 為地平線高度；
+   俯仰角 `pitch = atan((cy - vh) / f)`（地平線在中心下方表示相機朝上）；水平視角 `hfov = 2·atan(cx / f)`。
+   找不到兩組線時，用 `scene.json` 的 `camera.hfov_deg` 估計值，並以主角腳底落在地面來反推俯仰角。
+2. 相機高度依視角判斷（站立視角約 1.5–1.7 m），這個值決定整個場景的尺度。
+3. 建立 `RefCamera`：`sensor_fit='HORIZONTAL'`、`angle_x=hfov`、位置 `(0, 0, 高度)`、`rotation_euler=(π/2 + pitch, 0, 0)`；
+   渲染解析度設成原圖尺寸；把原圖掛成相機背景圖（`show_background_images`，alpha 0.5），方便使用者手動比對。
+4. 把求得的 `hfov_deg`、`height_m`、`pitch_deg` 寫回 `scene.json` 的 `camera` 當紀錄。
+
+**量尺寸的方法**（之後每個構件都這樣量）：像素 `(u, v)` 的視線方向是 `((u-cx)/f, 1, -(v-cy)/f)` 再套上俯仰旋轉；
+與地面 z = 0 的交點給出地面上的點；與一個已知的鉛直面（例如已定位的牆面）的交點給出該面上的高度。
+先量地面上的腳點，再用腳點所在的鉛直面量高度。如果地面有規則的鋪面格線，建一個對齊格線方向的 Empty 當所有建築的父物件，
+之後就能在「沿格線 / 垂直格線」的座標裡建模，數字會整齊很多。
+
+### 6.2 建築
+
+地面、樑柱、牆、階梯、路緣、花台、遠景大樓都在這裡建。用 `bmesh` 或 `from_pydata` 直接產生網格。
+
+- **照原圖的結構建，不要用幾個平面交差。** 天花板若有樑、凹縫、托架就建出來；柱子有倒角、分段縫就做出來；
+  花台、路緣、排水溝蓋、階梯與扶手都是實際的幾何。鋪面一塊一塊建（板與板之間留縫），每塊給一點隨機明暗。
+- 植物只生成植物本體；花台、底座這類規則的東西在這裡建。
+- 混凝土邊緣加 Bevel 修改器（1 段、寬 1–3 cm）；沒有倒角的邊在夜景裡吃不到光，會顯得假。
+- 原圖看不到的部分（建築背面、畫面外）用簡單的方盒封住即可，但不要留下會露出天空或地平線的破口。
+- 遠景：大樓用方盒加發光的窗戶 / 燈條 / 螢幕色塊就夠，重點是輪廓與亮暗位置對得上。
+
+**每建完一組構件就比對輪廓**：`look`（`mode="camera"`、`shading="wireframe"` 或 `solid`），和原圖逐項比較邊線位置；
+偏差超過幾個像素就回頭修正量測值。需要精確疊圖時，把 `look` 回傳的圖檔與原圖用 PIL 半透明疊起來看。
+主要結構（地面格線、最大的柱與牆、天花板邊緣）對上之後才往下做。
+
+### 6.3 匯入模型並擺位
+
+模型在步驟 5 檢視時已匯入。對每個物件：
+
+1. **整理**：合併成單一網格、套用變換、原點在底部中心；模型的正面若不是朝 -Y，先在網格資料上轉正。
+2. **定位置**：用 `bbox` 底邊中點的視線與地面（或它所站的平台面：花台土面、階梯上的平台）求交點，這比 `depth_m` 可靠；
+   掛在牆上的東西則與那面牆求交。`depth_m` 只在沒有可交的面時使用。
+3. **定大小**：優先用真實尺寸（報箱約 1.2 m、長椅寬約 1.6 m），再回頭確認輪廓與 `bbox` 吻合；不知道真實尺寸時才用 `bbox` 高度 × 距離 ÷ f。
+4. **定朝向**：對齊它旁邊的建築方向（沿路、貼牆），不要全部正對相機。
+5. **重複物件**：`obj.copy()` 產生共用網格的複本，各自擺位，不要重新匯入。
+6. `look`（camera）確認位置、大小、遮擋關係；再用 `mode="angles"` 從側面或上方看一次，確認沒有懸空、沒有插進地面或牆裡。
+   `get_scene_info` 的 `ground` 欄位可以直接列出誰浮著。
+
+**`image_slab` 物件**（招牌、螢幕、報紙）：依去背圖的不透明範圍建一塊薄板，正面貼 `rgba.png`（去背把面板吃掉時，改從候選圖直接裁出矩形），
+側面與背面用面板底色。發光的招牌把貼圖同時接到 Emission。平放在地上的（報紙）轉 -90° 並抬高 1 cm。
+
+**常見修正**
+
+| 問題 | 做法 |
 |---|---|
-| 物件左右或上下位置偏移 | 修 `bbox` |
-| 太大或太小 | 修 `bbox` 或 `depth_m`；姿勢與原圖不同的物件加 `"fit": "inside"` |
-| 浮在空中 | `grounded: true`，或 `support: true` 加底座 |
-| 前後遮擋關係錯 | 調 `depth_m` |
-| 面向不對 | `yaw_deg`；斜角生成的模型用 `model_yaw_deg` 先轉正 |
-| 背景空洞 | 在 `props` 加色塊（牆面、看板、前景遮擋） |
+| 生成的貼圖在夜景裡太亮（紙張、白色物件像在發光） | 在 Base Color 前插一個 Multiply，乘 0.3–0.6 |
+| 貼圖太暗看不出形狀 | 同上，乘 1.5–2 |
+| 螢幕 / 海報的 3D 貼圖是糊的 | 從 2D 候選圖把該面用 PIL 攤平成矩形，做成一片貼在模型正面前方幾毫米的發光平面，設為模型的子物件 |
+| 同款物件看起來一模一樣 | 複本各自轉一點角度；海報類換色調或換圖 |
 
 ### 步驟 6b：表面材質與散佈物
 
-擺位確認後，替程式生成的表面加材質，並在地面撒上小雜物。兩者都寫在 `scene.json`，由 `05_build_scene.py` 讀取；不需要另外跑腳本。這一步的效果只有完整渲染看得到（`--preview` 不顯示材質）。
+**材質**用程序化節點直接做，座標用世界空間位置（Geometry → Position），這樣紋理尺度就是真實的公尺，不需要 UV。
 
-**1. 看原圖判斷需要什麼。** 地面是什麼（磁磚、水泥、木地板、泥土、碎石地）？牆面呢？地上有沒有散落物（碎石、落葉、紙張、小玩具）？原圖看不清楚時，依場景類型給合理的預設，並在總結中註明是推測。
+- 混凝土 / 地面：大尺度噪波做明暗，再乘一層更大尺度的噪波當髒污（髒的地方粗糙度高、乾淨的地方較亮滑），細噪波接 Bump。
+- 老舊牆柱：沿 Z 拉長的噪波做水漬條紋。對比不要太大，先看原圖是乾淨還是斑駁。
+- 金屬、塗裝、玻璃：Principled BSDF 調 Metallic / Roughness 即可。
+- 程序化做不出來的質感才用 Poly Haven（CC0）：`python pipeline/polyhaven.py search|size|get`（下載到 `work/textures/<id>/`），
+  下載前先告訴使用者要下載什麼、來源、大小，預設 1k；在 Blender 裡用 Box 投影的 Image Texture 接上。只用 Poly Haven，其他來源授權不一。
+- 顏色以原圖為準。夜景的表面反照率通常比直覺暗很多（地面 0.1 左右），先調材質再調燈，不要用燈去補過亮的材質。
 
-**2. 設定表面材質**，寫在 `environment.surfaces`。可設定的表面：`floor`、`stage`、`hall_wall`、`balcony`。
+**散佈物**：原圖地上有什麼才撒什麼（紙張、碎石、落葉）。做 3–5 個原型網格，其餘用共用網格的複本，隨機位置、旋轉、大小；
+只撒在原圖有東西的區域，避開已放好的物件（用各物件的包圍盒檢查），全場景不超過 500 個。原圖沒有的東西不要加。
 
-```jsonc
-"surfaces": {
-  "floor":     {"preset": "tiles", "color": [0.10, 0.11, 0.15], "color2": [0.05, 0.055, 0.08], "scale_m": 0.8},
-  "hall_wall": {"preset": "painted", "color": [0.08, 0.09, 0.14], "scale_m": 3.0},
-  "balcony":   {"polyhaven": "concrete_floor_02", "scale_m": 2.0, "tint": [0.5, 0.55, 0.7]}
-}
-```
-
-| 來源 | 寫法 | 何時用 |
-|---|---|---|
-| 程序化預設（優先） | `"preset"`: `plain`、`concrete`、`tiles`、`painted`、`metal`、`gravel`、`wood` | 不需下載、風格容易統一；先試這個 |
-| Poly Haven 貼圖（CC0） | `"polyhaven": "<asset id>"` | 預設做不出來的質感（磨損地板、磚牆、岩石） |
-
-共用欄位：`color`（基色）、`scale_m`（**真實尺寸，公尺**：磁磚邊長、木板寬、碎石粒徑，或貼圖重複一次的寬度）、`roughness`、`tint`（只對 Poly Haven，用來把色調拉向原圖）。
-
-使用 Poly Haven 時：
-
-```bash
-python pipeline/polyhaven.py search concrete floor      # 找 asset id
-python pipeline/polyhaven.py size concrete_floor_02 1k  # 先看檔案大小，不下載
-python pipeline/polyhaven.py get "$PW" concrete_floor_02 1k   # 下載到 work/textures/<id>/
-```
-
-下載前先告訴使用者要下載什麼、來源、大小。預設用 1k（每組約 1–5 MB）；2k 以上只在特寫需要時才用。只用 Poly Haven（CC0）；其他來源授權不一，不要自行加入。
-
-**3. 設定散佈物**，寫在最上層的 `scatter`：
-
-```jsonc
-"scatter": [
-  {"id": "rubble", "kind": "rocks", "count": 60, "size_m": [0.03, 0.1],
-   "radius_m": 8.5, "inner_radius_m": 3.3, "colors": [[0.2, 0.2, 0.23]], "seed": 7}
-]
-```
-
-| 欄位 | 說明 |
-|---|---|
-| `kind` | `rocks`（不規則石塊）、`blocks`（倒角小方塊）、`papers`（平貼地面的紙張） |
-| `count` | 數量；全場景合計建議不超過 500 |
-| `size_m` | 尺寸範圍 `[最小, 最大]`，公尺 |
-| `radius_m` / `inner_radius_m` | 以主角為圓心的散佈環帶；用 `inner_radius_m` 把舞台或主角腳邊留空 |
-| `colors` | 顏色清單，省略時用該種類的預設色 |
-| `margin_m` | 與既有物件保持的距離（預設 0.15） |
-| `seed` | 換一個值就換一種分布 |
-
-散佈物是共用網格的實例，並會自動避開所有已放好的模型與道具，所以一定要在擺位確定之後才調這一步。
-
-**4. 渲染、看圖、調整。** 跑完整渲染（指令見下方步驟 6c），Read `view_ref.png` 和 `view_overview.png`，對照原圖檢查：
+`look`（camera、`rendered`）對照原圖檢查，最多調 3 輪。**通過條件**：表面看得出材質且尺度合理；散佈物沒有穿過任何物件；色調沒有偏離原圖。
 
 | 看到的問題 | 調整 |
 |---|---|
-| 紋理顆粒大得像巨石，或小到變成雜訊 | 改 `scale_m`（它是公尺，對照場景裡物件的真實大小） |
-| 看得出貼圖重複 | 加大 `scale_m`，或改用程序化預設 |
-| 色調和原圖不合 | 改 `color`；Poly Haven 材質改 `tint` |
-| 地面太亮或反光太強 | 調暗 `color`、提高 `roughness` |
-| 雜物太搶眼、太整齊或太稀疏 | 改 `count`、`size_m`、`colors`、`seed` |
-| 雜物出現在不該有的地方 | 調 `radius_m` / `inner_radius_m` |
-| 原圖沒有的東西 | 拿掉；不要為了豐富而加上會改變場景氣氛的元素 |
+| 紋理顆粒大得像巨石，或小到變成雜訊 | 改 Mapping 的 Scale（對照場景裡物件的真實大小） |
+| 色調和原圖不合 | 改基色 |
+| 地面太亮或反光太強 | 調暗基色、提高粗糙度 |
+| 雜物太搶眼、太整齊或太稀疏 | 改數量、大小、顏色、隨機種子 |
 
-最多調 3 輪。**通過條件**：表面看得出材質且尺度合理、沒有明顯重複；散佈物沒有穿過任何物件；整體色調沒有偏離原圖。
+### 步驟 6c：燈光、渲染、存檔
 
-### 步驟 6c：完整渲染與燈光
+確定 ComfyUI 與 TRELLIS 都已停止。引擎用 EEVEE（開 raytracing），色彩管理 AgX。
 
-確定 ComfyUI 與 TRELLIS 都已停止，跑完整渲染：
+**燈光**：先看原圖列出光源與它們照亮了什麼，再一盞一盞加，每加一盞就 `look`（`rendered`）。
 
-```bash
-"D:/Blender Foundation/Blender 5.2/blender.exe" -b -P pipeline/05_build_scene.py -- "$PW"
-# → scene.blend、work/renders/view_ref.png、view_overview.png
+- 每個看得到的光源（招牌、螢幕、路燈、店面）給一盞對應的燈，顏色取自原圖；發光物件本身用 Emission。
+- 主光要有方向。只有均勻的補光會讓場景發平；先把主光與最暗處定下來，補光最後才加，而且要弱。
+- World 用接近原圖天空的顏色；夜景幾乎是黑的。
+- 霧：遠景有霧氣時加一個 Volume Scatter 方盒，密度從 0.001 起。
+- 光暈：霓虹與螢幕周圍的 glow 用合成器的 Glare 節點（Type 設 Bloom）。`look` 的 `rendered` 看不到合成器效果，要真的渲染一次才看得到。
+- EEVEE 回報 shadow buffer 已滿時，把小的點綴燈關掉陰影，或調 `scene.eevee.shadow_pool_size`。
+
+**渲染與存檔**
+
+```python
+# 透過 execute_blender_code 執行
+scene.camera = bpy.data.objects["RefCamera"];      scene.render.filepath = r"$PW\work\renders\view_ref.png";      bpy.ops.render.render(write_still=True)
+scene.camera = bpy.data.objects["OverviewCamera"]; scene.render.filepath = r"$PW\work\renders\view_overview.png"; bpy.ops.render.render(write_still=True)
+scene.camera = bpy.data.objects["RefCamera"]
+bpy.ops.file.pack_all(); bpy.ops.wm.save_mainfile()
 ```
 
-Read 兩張渲染圖。光線太亮、太暗或霧太濃時調 `lights`（`key_spot.energy_w`、`fog_density`），最多調 3 輪。
-最後產生原圖與渲染的左右對照圖：
+`OverviewCamera` 放在場景斜上方、看得到全景的位置，用來檢查懸空與穿插。Read 兩張渲染圖，再產生左右對照圖並 Read：
 
 ```bash
 wsl -e bash -lc 'source ~/miniconda3/etc/profile.d/conda.sh; conda activate trellis2; python $P/pipeline/07_compare.py $P'
 # → work/renders/compare.png
 ```
 
-**通過條件**：主要物件的位置、大小、遮擋關係與原圖一致；沒有物件懸空或穿插；文字可讀。
+對照原圖逐項檢查，回到 Blender 修正，最多 3 輪：整體亮度與色調、每個光源的位置與顏色、主要物件的位置與大小、材質的明暗。
+
+**通過條件**：主要物件與建築輪廓的位置、大小、遮擋關係與原圖一致；沒有物件懸空或穿插；文字可讀；整體明暗與色調接近原圖；
+`scene.blend` 已存檔且貼圖已打包（沒有未打包的外部圖檔）。
 
 ## 9. 步驟 7：總結回報
 
 交付時說明：
 
-- 物件表：每個物件的做法（TRELLIS / 512 / image_slab / 程式生成）、生成了幾張 2D 圖、prompt 改了幾次、最終品質。
-- 表面材質與散佈物：各表面用了哪個預設或哪個 Poly Haven 素材（附 asset id）、撒了什麼、哪些是原圖看不清而推測的。
+- 物件表：每個物件的做法（TRELLIS / 512 / image_slab / 在 Blender 建模）、生成了幾張 2D 圖、prompt 改了幾次、最終品質。
+- 建築：建了哪些結構、尺寸怎麼量出來的。
+- 表面材質與散佈物：各表面是程序化節點還是 Poly Haven 素材（附 asset id）、撒了什麼、哪些是原圖看不清而推測的。
 - 不合格或妥協的項目與原因。
 - 與原圖的已知差異（深度是估計值、被遮擋處是模型補的）。
 - 各階段耗時（可從 `work/generation_log.jsonl` 和 `work/trellis.log` 取得）。
@@ -379,7 +390,7 @@ wsl -e bash -lc 'source ~/miniconda3/etc/profile.d/conda.sh; conda activate trel
 ## 10. 檔案對照
 
 ```
-scene.json                      場景定義（你撰寫與修改）
+scene.json                      物件定義（你撰寫與修改）
 pipeline/00_grid.py             座標格線圖
 pipeline/01_make_refs.py        參考裁切圖
 pipeline/02_generate.py         FLUX.2 生成（--next 迭代模式 / 批次模式）
@@ -388,14 +399,11 @@ pipeline/comfy_start.sh|stop.sh 啟動 / 停止 ComfyUI
 pipeline/03_select_matte.py     對照表（sheet）與去背（matte）
 pipeline/04_trellis_batch.py    TRELLIS.2 批次（被 loop 呼叫）
 pipeline/trellis_loop.sh        TRELLIS 自動重啟迴圈
-pipeline/05_build_scene.py      組裝 Blender 場景（--preview 為預覽）
-pipeline/scene_surfaces.py      表面材質預設與散佈物（被 05 匯入）
-scene_env.py                    場景專用的建築腳本（environment.type 為 "script" 時由 05 載入）
 pipeline/polyhaven.py           搜尋 / 下載 Poly Haven CC0 貼圖
-pipeline/06_inspect_models.py   3D 模型檢視圖
 pipeline/07_compare.py          原圖與渲染的對照圖
 work/objects/<id>/              ref.png、cand_*.png、prompts.json、sheet.png、rgba.png、review.png、model.glb
 work/selection.json             選圖結果與理由（你撰寫）
 work/textures/<asset id>/       下載的 Poly Haven 貼圖
-work/inspect/, work/renders/    檢視圖與渲染圖
+work/renders/                   渲染圖與對照圖
+scene.blend                     場景本身：由你透過 Blender MCP 建立，沒有對應的建置腳本
 ```
