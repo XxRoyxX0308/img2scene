@@ -23,7 +23,9 @@ PREVIEW = "--preview" in sys.argv   # Workbench renders (no lighting/fog, almost
 scene_cfg = json.load(open(os.path.join(PROJECT, "scene.json"), encoding="utf-8"))
 IMG_W, IMG_H = scene_cfg["image_size"]
 env = scene_cfg["environment"]
-ENV_TYPE = env.get("type", "round_hall")   # "round_hall": circular lobby with a stage; "ruin_hall": walls traced from the image
+# "round_hall": circular lobby with a stage; "ruin_hall": walls traced from the image;
+# "script": the architecture is modelled by a scene-specific Python file (environment.script), see load_env_script
+ENV_TYPE = env.get("type", "round_hall")
 STAGE_R, STAGE_H = (env["stage"]["radius_m"], env["stage"]["height_m"]) if "stage" in env else (0.0, 0.0)
 HALL_R = env["hall"]["radius_m"] if "hall" in env else env.get("scatter_limit_m", 30.0)
 # renders default to 2x the image; large images set render_width instead
@@ -77,7 +79,10 @@ def tight_bbox(obj_cfg):
 
 
 def solve_pitch():
-    """Pitch so that the anchor's feet (bbox bottom, at its depth) land on the stage top."""
+    """Pitch so that the anchor's feet (bbox bottom, at its depth) land on the stage top.
+    camera.pitch_deg overrides it when the pitch is known (e.g. from the horizon / vanishing points)."""
+    if "pitch_deg" in cam_cfg:
+        return math.radians(cam_cfg["pitch_deg"])
     v = tight_bbox(anchor)[3]
     y_up = -(v - IMG_H / 2) / FOCAL
     target = (STAGE_H - CAM_POS.z) / anchor["depth_m"]
@@ -116,7 +121,12 @@ ANCHOR_XY = unproject((ANCHOR_BB[0] + ANCHOR_BB[2]) / 2, ANCHOR_BB[3], anchor["d
 print(f"camera pitch {math.degrees(PITCH):.2f} deg, focal {FOCAL:.0f}px, anchor xy {tuple(round(c, 2) for c in ANCHOR_XY)}")
 
 
+ENV_SCRIPT = None   # module loaded for environment.type == "script"
+
+
 def support_height(xy):
+    if ENV_SCRIPT and hasattr(ENV_SCRIPT, "support_height"):
+        return ENV_SCRIPT.support_height(Vector(xy))
     return STAGE_H if (Vector(xy) - ANCHOR_XY).length < STAGE_R else 0.0
 
 
@@ -270,6 +280,24 @@ def build_ruin_hall():
             add_box(f"roof_beam{i}", ((x0 + x1) / 2, y, z - 0.35), (x1 - x0, 0.35, 0.7), beam_mat, col_env)
 
 
+def build_env_script():
+    """Architecture too specific for the presets is modelled by a Python file next to scene.json
+    (environment.script). It defines build(ctx) and may define lights(ctx), support_height(xy) -> floor height under
+    a point (raised platforms) and scatter_allowed(xy). ctx hands it this file's helpers and the camera model."""
+    global ENV_SCRIPT
+    import importlib.util
+    import types
+    spec = importlib.util.spec_from_file_location("scene_env", os.path.join(PROJECT, env["script"]))
+    ENV_SCRIPT = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ENV_SCRIPT)
+    ENV_SCRIPT.ctx = types.SimpleNamespace(
+        project=PROJECT, cfg=scene_cfg, preview=PREVIEW, scene=scene, col_env=col_env, col_props=col_props,
+        col_light=col_light, material=material, add_box=add_box, move_to=move_to, look_at=look_at,
+        surface=lambda name, fallback: scene_surfaces.surface_material(name, SURFACES.get(name), fallback, PROJECT),
+        unproject=unproject, ground_hit=ground_hit, pixel_dir=pixel_dir, cam_pos=CAM_POS, focal=FOCAL, pitch=PITCH)
+    ENV_SCRIPT.build(ENV_SCRIPT.ctx)
+
+
 def build_props():
     support_mat = material("support_dark", (0.05, 0.055, 0.08), rough=0.7)
     for p in scene_cfg.get("props", []):
@@ -398,16 +426,54 @@ def build_image_slab(cfg):
     return front, Vector((1.0, thick + relief, aspect))
 
 
+def make_emissive(obj, strength, threshold=0.0):
+    """Let an object glow with its own base colour (lit signs, screens). threshold > 0 limits the glow to the bright
+    parts of the texture, so a kiosk's poster lights up but its dark frame does not."""
+    for m in obj.data.materials:
+        bsdf = m.node_tree.nodes.get("Principled BSDF") if m and m.use_nodes else None
+        if not bsdf:
+            continue
+        nt, base = m.node_tree, bsdf.inputs["Base Color"]
+        if not base.is_linked:
+            bsdf.inputs["Emission Color"].default_value = base.default_value
+            bsdf.inputs["Emission Strength"].default_value = strength
+            continue
+        col = base.links[0].from_socket
+        nt.links.new(col, bsdf.inputs["Emission Color"])
+        if threshold > 0:
+            bw = nt.nodes.new("ShaderNodeRGBToBW")
+            rng = nt.nodes.new("ShaderNodeMapRange")
+            rng.inputs["From Min"].default_value, rng.inputs["From Max"].default_value = threshold, min(1.0, threshold + 0.25)
+            rng.inputs["To Min"].default_value, rng.inputs["To Max"].default_value = 0.0, strength
+            nt.links.new(col, bw.inputs["Color"])
+            nt.links.new(bw.outputs["Val"], rng.inputs["Value"])
+            nt.links.new(rng.outputs["Result"], bsdf.inputs["Emission Strength"])
+        else:
+            bsdf.inputs["Emission Strength"].default_value = strength
+
+
 def place_model(obj, dims, bbox, depth, grounded, yaw_deg, support, name, support_mat, fit="dominant", roll_deg=0.0,
-                pitch_deg=0.0, lift_m=0.0):
+                pitch_deg=0.0, lift_m=0.0, size=None, pos=None):
+    """size = {"width_m" | "height_m": ...} and pos = [x, y] or [x, y, z] (world metres, base centre) replace the
+    values derived from the bbox when the real size / position is known (e.g. measured on the paving grid)."""
     u1, v1, u2, v2 = bbox
     w, h = px_to_m(u2 - u1, depth), px_to_m(v2 - v1, depth)
-    if fit == "inside":      # whole model inside the bbox (for objects whose pose differs from the image)
+    size = size or {}
+    if "height_m" in size:
+        s = size["height_m"] / dims.z
+    elif "width_m" in size:
+        s = size["width_m"] / dims.x
+    elif fit == "inside":    # whole model inside the bbox (for objects whose pose differs from the image)
         s = min(w / dims.x, h / dims.z)
     else:                    # match the dominant silhouette dimension
         s = w / dims.x if (u2 - u1) > (v2 - v1) else h / dims.z
     c = unproject((u1 + u2) / 2, (v1 + v2) / 2, depth)
+    if pos:
+        c = Vector((pos[0], pos[1], c.z))
+        grounded = grounded or len(pos) == 2
     z = support_height(c.xy) + lift_m if grounded else c.z - s * dims.z / 2
+    if pos and len(pos) > 2:
+        z = pos[2]
     obj.location = (c.x, c.y, z)
     obj.scale = (s, s, s)
     obj.rotation_mode = 'XYZ'   # glTF imports come in as quaternion-rotated objects
@@ -422,23 +488,30 @@ def build_models():
     for cfg in scene_cfg["objects"]:
         glb = os.path.join(PROJECT, "work", "objects", cfg["id"], "model.glb")
         if cfg.get("mode") == "image_slab":
+            if not os.path.exists(os.path.join(PROJECT, "work", "objects", cfg["id"], cfg.get("slab_image", "rgba.png"))):
+                print(f"no slab image for {cfg['id']}, skipped")
+                continue
             obj, dims = build_image_slab(cfg)
         elif cfg.get("status") == "rejected" or not os.path.exists(glb):
             print(f"no model for {cfg['id']}, skipped")
             continue
         else:
             obj, dims = import_glb(glb, cfg["id"], cfg.get("model_yaw_deg", 0.0))
+        if cfg.get("emission"):
+            make_emissive(obj, cfg["emission"], cfg.get("emission_threshold", 0.0))
         place_model(obj, dims, tight_bbox(cfg), cfg["depth_m"], cfg.get("grounded", False), cfg.get("yaw_deg", 0),
                     cfg.get("support", False), cfg["id"], support_mat, cfg.get("fit", "dominant"), cfg.get("roll_deg", 0.0),
-                    cfg.get("pitch_deg", 0.0), cfg.get("lift_m", 0.0))
+                    cfg.get("pitch_deg", 0.0), cfg.get("lift_m", 0.0), cfg, cfg.get("pos_m"))
         # repeated objects are linked duplicates of the same mesh
         for i, inst in enumerate(cfg.get("instances", [])):
             dup = obj.copy()
             dup.name = f"{cfg['id']}_inst{i + 1}"
             col_models.objects.link(dup)
-            place_model(dup, dims, inst["bbox"], inst["depth_m"], inst.get("grounded", False), inst.get("yaw_deg", 0),
+            place_model(dup, dims, inst.get("bbox", cfg["bbox"]), inst.get("depth_m", cfg["depth_m"]),
+                        inst.get("grounded", False), inst.get("yaw_deg", 0),
                         inst.get("support", False), dup.name, support_mat, inst.get("fit", cfg.get("fit", "dominant")),
-                        inst.get("roll_deg", 0.0), inst.get("pitch_deg", 0.0), inst.get("lift_m", 0.0))
+                        inst.get("roll_deg", 0.0), inst.get("pitch_deg", 0.0), inst.get("lift_m", 0.0),
+                        inst if ("width_m" in inst or "height_m" in inst) else cfg, inst.get("pos_m"))
 
 
 # ---------------------------------------------------------------- camera, lights, fog
@@ -471,6 +544,14 @@ def build_camera_and_lights():
     over.location = (ANCHOR_XY.x - 4.8, ANCHOR_XY.y - 7.0, 2.6)
     look_at(over, (ANCHOR_XY.x + 0.6, ANCHOR_XY.y + 1.0, 2.6))
     col_light.objects.link(over)
+    if ENV_TYPE == "script":
+        ov = env.get("overview", {})
+        over.location = ov.get("location", (ANCHOR_XY.x + 6.0, ANCHOR_XY.y - 8.0, 6.0))
+        look_at(over, ov.get("target", (ANCHOR_XY.x, ANCHOR_XY.y, 1.5)))
+        over_data.lens = ov.get("lens_mm", 20)
+        if hasattr(ENV_SCRIPT, "lights"):
+            ENV_SCRIPT.lights(ENV_SCRIPT.ctx)
+        return cam, over
     if ENV_TYPE == "ruin_hall":
         ov = env.get("overview", {})
         over.location = ov.get("location", (ANCHOR_XY.x + 6.0, ANCHOR_XY.y - 5.0, 5.5))
@@ -627,12 +708,13 @@ def render(cam, name):
     bpy.ops.render.render(write_still=True)
 
 
-build_ruin_hall() if ENV_TYPE == "ruin_hall" else build_environment()
+{"ruin_hall": build_ruin_hall, "script": build_env_script}.get(ENV_TYPE, build_environment)()
 build_props()
 build_models()
 # small clutter goes in last so it can avoid everything that is already standing on the floor
 scene_surfaces.scatter(scene_cfg.get("scatter"), col_scatter, ANCHOR_XY, support_height,
-                       (col_models, col_props), HALL_R, allowed=inside_hall if WALL_PLANES else None)
+                       (col_models, col_props), HALL_R,
+                       allowed=getattr(ENV_SCRIPT, "scatter_allowed", None) or (inside_hall if WALL_PLANES else None))
 ref_cam, over_cam = build_camera_and_lights()
 setup_render()
 os.makedirs(os.path.join(PROJECT, "work", "renders"), exist_ok=True)

@@ -67,6 +67,10 @@
 - 至少 10 種不同物件，主角之外也要有道具與細節（燈具、招牌、箱子、支架等）。
 - 重複出現的同款物件只列一次，其餘用 `instances`。
 - 大面積結構（地板、牆、舞台、窗戶、前景遮擋）不走 img-to-3D，寫進 `environment` 與 `props`，由 Blender 程式生成。
+- 建築本身需要精確重建（樑、柱、階梯、路緣等不只是平面）時，設 `"environment": {"type": "script", "script": "scene_env.py"}`，
+  在專案根目錄寫一個該場景專用的 Python 檔：定義 `build(ctx)`，可選 `lights(ctx)`、`support_height(xy)`（回傳該點的地面高度，
+  用於高台與花台）、`scatter_allowed(xy)`。`ctx` 提供 `material`、`surface`（讀 `environment.surfaces.<名稱>`）、相機模型等輔助函式。
+  先用 `--preview` 渲染並與原圖疊圖比對輪廓，再調整尺寸。
 - 帶文字的平面物件（招牌、標示牌）設 `"mode": "image_slab"`：TRELLIS 會把文字重建成亂碼，這類物件改用正面 2D 圖做成立體浮雕板。
 
 **scene.json 結構**（完整範例見專案現有的 `scene.json`）
@@ -114,6 +118,12 @@
 | `mode: "image_slab"` | 文字招牌；搭配 `slab_image`（預設用 `"rgba.png"`）、`slab_thickness`、`slab_relief` |
 | `trellis.pipeline_type` | 預設 `"1024_cascade"`；**實心方塊類（箱子、積木、櫃子）必須設 `"512"`**，否則 VRAM 不足會 CUDA 錯誤 |
 | `trellis.seed` | 3D 重做時換種子 |
+| `pos_m` | 已知真實位置時直接指定底部中心的世界座標 `[x, y]`（貼地）或 `[x, y, z]`，取代由 bbox 與深度反推的位置；`instances` 也可用 |
+| `width_m` / `height_m` | 已知真實尺寸時直接指定，取代由 bbox 推算的縮放；`instances` 也可用 |
+| `pitch_deg` | 繞水平軸旋轉；`image_slab` 設 `-90` 可平放在地上（報紙、海報） |
+| `emission` / `emission_threshold` | 讓物件以自身貼圖顏色發光（招牌、螢幕）；`emission_threshold` > 0 時只有貼圖亮部發光 |
+
+相機的 `camera.pitch_deg` 可直接指定俯仰角（例如由地平線或消失點算出），省略時由主角腳底位置反推。
 
 深度估計原則：先定主角的距離，其他物件依前後遮擋關係相對給值；同一平面上的東西給相同深度。寬度（公尺）≈ bbox 像素寬 ÷ 703 × 深度（hfov 50°、圖寬 656 時），用它檢查尺寸是否合理。
 
@@ -380,6 +390,7 @@ pipeline/04_trellis_batch.py    TRELLIS.2 批次（被 loop 呼叫）
 pipeline/trellis_loop.sh        TRELLIS 自動重啟迴圈
 pipeline/05_build_scene.py      組裝 Blender 場景（--preview 為預覽）
 pipeline/scene_surfaces.py      表面材質預設與散佈物（被 05 匯入）
+scene_env.py                    場景專用的建築腳本（environment.type 為 "script" 時由 05 載入）
 pipeline/polyhaven.py           搜尋 / 下載 Poly Haven CC0 貼圖
 pipeline/06_inspect_models.py   3D 模型檢視圖
 pipeline/07_compare.py          原圖與渲染的對照圖
